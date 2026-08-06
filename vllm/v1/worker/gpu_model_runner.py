@@ -194,6 +194,11 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_observer import (
+    DraftTrainingStep,
+    has_draft_observers,
+    notify_draft_observers,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -576,6 +581,8 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # Target layers aux_hidden_states is gathered from, resolved at model load.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -5011,6 +5018,13 @@ class GPUModelRunner(
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ) -> list[list[int]] | torch.Tensor:
+        self._notify_draft_observers(
+            scheduler_output,
+            sampled_token_ids,
+            hidden_states,
+            aux_hidden_states,
+            spec_decode_metadata,
+        )
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
@@ -5471,6 +5485,38 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+    def _notify_draft_observers(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        """Hand this step's activations to any registered draft observer.
+
+        Args:
+            scheduler_output: This step's schedule.
+            sampled_token_ids: Accepted tokens, `-1` where rejected.
+            hidden_states: Post-norm final activations.
+            aux_hidden_states: Per-feature-layer activations, or None.
+            spec_decode_metadata: Per-request draft counts, or None.
+        """
+        if not has_draft_observers():
+            return
+        notify_draft_observers(
+            DraftTrainingStep(
+                scheduler_output=scheduler_output,
+                input_batch=self.input_batch,
+                input_ids=self.input_ids.gpu,
+                hidden_states=hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                aux_layer_ids=self.aux_hidden_state_layers,
+                sampled_token_ids=sampled_token_ids,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+        )
+
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:
             return
@@ -5491,6 +5537,7 @@ class GPUModelRunner(
             aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
 
         self.model.set_aux_hidden_state_layers(aux_layers)
+        self.aux_hidden_state_layers = tuple(aux_layers)
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
